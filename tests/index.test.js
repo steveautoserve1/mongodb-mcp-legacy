@@ -2,9 +2,12 @@ import { describe, it, expect } from 'vitest';
 import pkg from 'mongodb';
 import {
   parseDatabaseName,
+  parseLimit,
   parseQuery,
+  parseSkip,
   sanitizeError,
   transformQuery,
+  validatePipeline,
 } from '../lib/utils.js';
 
 const { ObjectId } = pkg;
@@ -268,5 +271,174 @@ describe('sanitizeError', () => {
   it('leaves messages without URIs unchanged', () => {
     const msg = 'Collection not found';
     expect(sanitizeError(msg)).toBe('Collection not found');
+  });
+});
+
+describe('validatePipeline', () => {
+  it('accepts a plain read-only pipeline', () => {
+    const pipeline = [
+      { $match: { status: 'active' } },
+      { $group: { _id: '$category', total: { $sum: 1 } } },
+    ];
+    expect(validatePipeline(pipeline)).toBe(pipeline);
+  });
+
+  it('accepts an empty pipeline', () => {
+    expect(validatePipeline([])).toEqual([]);
+  });
+
+  it('rejects a non-array pipeline', () => {
+    expect(() => validatePipeline({ $match: {} })).toThrow(
+      'Pipeline must be a JSON array'
+    );
+  });
+
+  it('rejects non-object stages', () => {
+    expect(() => validatePipeline(['not a stage'])).toThrow(
+      'Pipeline stage 0 must be an object'
+    );
+    expect(() => validatePipeline([null])).toThrow(
+      'Pipeline stage 0 must be an object'
+    );
+  });
+
+  it('rejects $out stages', () => {
+    expect(() => validatePipeline([{ $match: {} }, { $out: 'steal' }])).toThrow(
+      'forbidden stage operator(s) $out'
+    );
+  });
+
+  it('rejects $merge stages', () => {
+    expect(() => validatePipeline([{ $merge: { into: 'steal' } }])).toThrow(
+      'forbidden stage operator(s) $merge'
+    );
+  });
+
+  it('rejects $function stages', () => {
+    expect(() =>
+      validatePipeline([{ $project: { x: { $function: { body: '1' } } } }])
+    ).toThrow('forbidden operator $function');
+  });
+
+  it('rejects $function at any nesting depth', () => {
+    expect(() =>
+      validatePipeline([
+        {
+          $addFields: {
+            nested: {
+              deep: { $function: { body: '1', args: [], lang: 'js' } },
+            },
+          },
+        },
+      ])
+    ).toThrow('forbidden operator $function');
+  });
+
+  it('rejects fields literally named $function (security trade-off)', () => {
+    expect(() => validatePipeline([{ $match: { $function: 'x' } }])).toThrow(
+      'forbidden operator $function'
+    );
+  });
+
+  it('allows field references named like forbidden stages', () => {
+    // "$out" as a *field value* (field reference), not a stage operator.
+    expect(() =>
+      validatePipeline([{ $group: { _id: '$out', n: { $sum: 1 } } }])
+    ).not.toThrow();
+  });
+
+  it('allows $merge nested inside an expression (stage-level only check)', () => {
+    expect(() =>
+      validatePipeline([{ $project: { odd: { $merge: 1 } } }])
+    ).not.toThrow();
+  });
+
+  it('reports the offending stage index', () => {
+    expect(() =>
+      validatePipeline([{ $match: {} }, { $match: {} }, { $out: 'x' }])
+    ).toThrow('Pipeline stage 2');
+  });
+});
+
+describe('parseLimit', () => {
+  it('returns the fallback for undefined/null', () => {
+    expect(parseLimit(undefined, 10, 1000)).toBe(10);
+    expect(parseLimit(null, 100, 1000)).toBe(100);
+  });
+
+  it('accepts zero explicitly', () => {
+    expect(parseLimit(0, 10, 1000)).toBe(0);
+  });
+
+  it('clamps to the cap', () => {
+    expect(parseLimit(5000, 10, 1000)).toBe(1000);
+  });
+
+  it('passes through valid values', () => {
+    expect(parseLimit(42, 10, 1000)).toBe(42);
+  });
+
+  it('rejects negative values', () => {
+    expect(() => parseLimit(-1, 10, 1000)).toThrow(
+      'limit must be a non-negative integer'
+    );
+  });
+
+  it('rejects non-integers', () => {
+    expect(() => parseLimit(1.5, 10, 1000)).toThrow(
+      'limit must be a non-negative integer'
+    );
+  });
+
+  it('rejects non-numeric strings', () => {
+    expect(() => parseLimit('10', 10, 1000)).toThrow(
+      'limit must be a non-negative integer'
+    );
+  });
+});
+
+describe('parseSkip', () => {
+  it('returns 0 for undefined/null', () => {
+    expect(parseSkip(undefined)).toBe(0);
+    expect(parseSkip(null)).toBe(0);
+  });
+
+  it('passes through valid values', () => {
+    expect(parseSkip(7)).toBe(7);
+  });
+
+  it('rejects negative values', () => {
+    expect(() => parseSkip(-3)).toThrow('skip must be a non-negative integer');
+  });
+
+  it('rejects non-integers', () => {
+    expect(() => parseSkip(2.5)).toThrow('skip must be a non-negative integer');
+  });
+});
+
+describe('transformQuery prototype safety', () => {
+  it('does not pollute Object.prototype via __proto__ keys', () => {
+    const parsed = JSON.parse('{"__proto__": {"polluted": true}}');
+    const result = transformQuery(parsed);
+    expect({}.polluted).toBeUndefined();
+    expect(Object.getPrototypeOf(result) === null).toBe(true);
+    expect(result.__proto__.polluted).toBe(true);
+  });
+
+  it('handles __proto__ nested in a query', () => {
+    const result = transformQuery({
+      status: 'active',
+      nested: { __proto__: { polluted: true } },
+    });
+    expect({}.polluted).toBeUndefined();
+    expect(result.status).toBe('active');
+  });
+
+  it('keeps constructor and toString keys as plain properties', () => {
+    const result = transformQuery({ constructor: 'x', toString: 1 });
+    expect(Object.prototype.hasOwnProperty.call(result, 'constructor')).toBe(
+      true
+    );
+    expect(result.constructor).toBe('x');
   });
 });

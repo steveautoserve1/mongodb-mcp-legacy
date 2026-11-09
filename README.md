@@ -52,6 +52,13 @@ npm install -g mongodb-mcp-legacy
 
 The server reads the `MONGODB_URI` environment variable to connect. If not set, it defaults to `mongodb://localhost:27017`.
 
+| Variable                          | Default                     | Description                                                                                                                                               |
+| --------------------------------- | --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `MONGODB_URI`                     | `mongodb://localhost:27017` | Connection string. **Must include a database name** (e.g. `mongodb://host:27017/mydb`).                                                                   |
+| `MONGODB_MCP_ALLOW_ALL_DATABASES` | _(unset)_                   | Set to `true` to let tools address databases other than the `MONGODB_URI` database and to enumerate all databases. Default: strict single-database scope. |
+| `MONGODB_MCP_MAX_LIMIT`           | `1000`                      | Hard cap on documents a single `execute_query`/`aggregate` call may return.                                                                               |
+| `MONGODB_MCP_MAX_TIME_MS`         | `10000`                     | Server-side timeout (ms) applied to every operation.                                                                                                      |
+
 ### Claude Code
 
 Add to your Claude Code config (`~/.claude.json`):
@@ -121,12 +128,14 @@ MONGODB_URI="mongodb://localhost:27017/mydb" node index.js
 
 ## Available Tools
 
-| Tool               | Description                                                         | Parameters                                                                                                     |
-| ------------------ | ------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `list_databases`   | List databases (falls back to current database without admin perms) | _(none)_                                                                                                       |
-| `list_collections` | List all collections in a database                                  | `database` (optional)                                                                                          |
-| `execute_query`    | Execute a read-only find query                                      | `database` (optional), `collection` (required), `query` (optional JSON string), `limit` (optional, default 10) |
-| `count_documents`  | Count documents matching a filter                                   | `database` (optional), `collection` (required), `query` (optional JSON string)                                 |
+| Tool               | Description                                                                               | Parameters                                                                                                                                                          |
+| ------------------ | ----------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `list_databases`   | List databases (scoped to the URI database unless `MONGODB_MCP_ALLOW_ALL_DATABASES=true`) | _(none)_                                                                                                                                                            |
+| `list_collections` | List all collections in a database                                                        | `database` (optional)                                                                                                                                               |
+| `execute_query`    | Execute a read-only find query                                                            | `database` (optional), `collection` (required), `query` (optional JSON string), `sort` (optional JSON), `skip` (optional), `limit` (optional, default 10, max 1000) |
+| `count_documents`  | Count documents matching a filter                                                         | `database` (optional), `collection` (required), `query` (optional JSON string)                                                                                      |
+| `distinct_values`  | Get distinct values for a field                                                           | `database` (optional), `collection` (required), `field` (required), `query` (optional JSON string)                                                                  |
+| `aggregate`        | Execute a read-only aggregation pipeline (`$out`/`$merge`/`$function` rejected)           | `database` (optional), `collection` (required), `pipeline` (required JSON array), `limit` (optional, default 100, max 1000)                                         |
 
 ### Examples
 
@@ -139,6 +148,14 @@ execute_query({ collection: "users", query: '{"status": "active"}', limit: 5 })
 
 count_documents({ collection: "orders", query: '{"total": {"$gt": 100}}' })
 ```
+
+## Security
+
+- **Enforced read-only** -- the `aggregate` tool rejects pipelines containing `$out`, `$merge`, or `$function`, so no tool in this server can write data or execute server-side JavaScript.
+- **Single-database scope by default** -- tools only address the database named in `MONGODB_URI` (and `list_databases` only reports it) unless you explicitly set `MONGODB_MCP_ALLOW_ALL_DATABASES=true`. For defense in depth, still use a least-privilege MongoDB user.
+- **Bounded reads** -- every operation runs with a server-side `maxTimeMS` timeout (default 10 s) and result sets are capped (default 1000 documents per call).
+- **Credential redaction** -- error messages are scrubbed of `user:***@` URI credentials before they reach the MCP client.
+- **No telemetry** -- the server makes no network calls other than the MongoDB connection in `MONGODB_URI`. Production dependencies are the official `mongodb` driver and the official MCP SDK.
 
 ## Development
 
