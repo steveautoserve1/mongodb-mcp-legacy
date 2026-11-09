@@ -9,6 +9,9 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import pkg from 'mongodb';
 import {
+  assertBoundedString,
+  capValues,
+  isAuthorizationError,
   parseDatabaseName,
   parseLimit,
   parseQuery,
@@ -35,29 +38,48 @@ const ALLOW_ALL_DATABASES =
   process.env.MONGODB_MCP_ALLOW_ALL_DATABASES === 'true';
 /** Hard cap on how many documents a single call may return. */
 const MAX_LIMIT = positiveIntEnv('MONGODB_MCP_MAX_LIMIT', 1000);
+/** Hard cap on how many documents a single call may scan past (skip). */
+const MAX_SKIP = positiveIntEnv('MONGODB_MCP_MAX_SKIP', 1000000);
+/** Hard cap on the length (characters) of any single string argument. */
+const MAX_INPUT_LENGTH = positiveIntEnv('MONGODB_MCP_MAX_INPUT_LENGTH', 65536);
+/** Hard cap on how many distinct values a single call may return. */
+const MAX_DISTINCT = positiveIntEnv('MONGODB_MCP_MAX_DISTINCT', 1000);
 /** Server-side timeout (ms) applied to every operation. */
 const MAX_TIME_MS = positiveIntEnv('MONGODB_MCP_MAX_TIME_MS', 10000);
 
 let client = null;
 let db = null;
+let connectPromise = null;
 
-async function connectMongoDB() {
-  if (!client) {
-    if (!DEFAULT_DB_NAME) {
-      throw new Error(
-        'MONGODB_URI must include a database name (e.g. mongodb://host:port/mydb)'
-      );
-    }
-    client = await MongoClient.connect(MONGODB_URI, {
-      useNewUrlParser: true,
-      useUnifiedTopology: true,
-      connectTimeoutMS: 10000,
-      serverSelectionTimeoutMS: 10000,
+/**
+ * Connect (once). Concurrent callers share a single in-flight connect;
+ * a failed connect clears the pending promise so later calls retry.
+ */
+function connectMongoDB() {
+  if (client) return Promise.resolve({ client, db });
+  if (!connectPromise) {
+    connectPromise = (async () => {
+      if (!DEFAULT_DB_NAME) {
+        throw new Error(
+          'MONGODB_URI must include a database name (e.g. mongodb://host:port/mydb)'
+        );
+      }
+      const c = await MongoClient.connect(MONGODB_URI, {
+        useNewUrlParser: true,
+        useUnifiedTopology: true,
+        connectTimeoutMS: 10000,
+        serverSelectionTimeoutMS: 10000,
+      });
+      client = c;
+      db = c.db(DEFAULT_DB_NAME);
+      console.error(`Connected to MongoDB: ${DEFAULT_DB_NAME}`);
+      return { client, db };
+    })().catch((error) => {
+      connectPromise = null;
+      throw error;
     });
-    db = client.db(DEFAULT_DB_NAME);
-    console.error(`Connected to MongoDB: ${DEFAULT_DB_NAME}`);
   }
-  return { client, db };
+  return connectPromise;
 }
 
 async function shutdown() {
@@ -70,6 +92,26 @@ async function shutdown() {
 
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
+
+/** Reject with a timeout error if `promise` does not settle within `ms`. */
+function withTimeout(promise, ms, label) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`${label} timed out after ${ms}ms`)),
+      ms
+    );
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      }
+    );
+  });
+}
 
 const server = new Server(
   {
@@ -129,7 +171,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             query: {
               type: 'string',
               description:
-                'Query filter as JSON string. Supports MongoDB extended JSON: use {"$oid": "..."} for ObjectId, {"$date": "..."} for ISODate, and {"$regex": "...", "$options": "..."} for regular expressions',
+                'Query filter as JSON string. Supports MongoDB extended JSON: use {"$oid": "..."} for ObjectId, {"$date": "..."} for ISODate, and {"$regex": "...", "$options": "ims"} for regular expressions. The $where operator is rejected.',
             },
             sort: {
               type: 'string',
@@ -139,7 +181,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             skip: {
               type: 'number',
               description:
-                'Number of documents to skip (default: 0, must be a non-negative integer)',
+                'Number of documents to skip (default: 0, non-negative integer, hard-capped by MONGODB_MCP_MAX_SKIP, default 1000000)',
             },
             limit: {
               type: 'number',
@@ -168,7 +210,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             query: {
               type: 'string',
               description:
-                'Query filter as JSON string. Supports MongoDB extended JSON: use {"$oid": "..."} for ObjectId and {"$date": "..."} for ISODate',
+                'Query filter as JSON string. Supports MongoDB extended JSON: use {"$oid": "..."} for ObjectId and {"$date": "..."} for ISODate. The $where operator is rejected.',
             },
           },
           required: ['collection'],
@@ -176,7 +218,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'distinct_values',
-        description: 'Get distinct values for a field in a collection',
+        description:
+          'Get distinct values for a field in a collection (result capped by MONGODB_MCP_MAX_DISTINCT, default 1000, truncated with a note)',
         inputSchema: {
           type: 'object',
           properties: {
@@ -196,7 +239,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             query: {
               type: 'string',
               description:
-                'Optional query filter as JSON string. Supports MongoDB extended JSON: use {"$oid": "..."} for ObjectId, {"$date": "..."} for ISODate, and {"$regex": "...", "$options": "..."} for regular expressions',
+                'Optional query filter as JSON string. Supports MongoDB extended JSON: use {"$oid": "..."} for ObjectId, {"$date": "..."} for ISODate, and {"$regex": "...", "$options": "ims"} for regular expressions. The $where operator is rejected.',
             },
           },
           required: ['collection', 'field'],
@@ -205,7 +248,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: 'aggregate',
         description:
-          'Execute a read-only aggregation pipeline on a collection. Write and code-execution stages ($out, $merge, $function) are rejected.',
+          'Execute a read-only aggregation pipeline on a collection. Write, code-execution, and $where operators ($out, $merge, $function, $accumulator, $where) are rejected. Pipelines are limited to 100 stages.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -221,7 +264,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             pipeline: {
               type: 'string',
               description:
-                'Aggregation pipeline as JSON array string. Supports MongoDB extended JSON: use {"$oid": "..."} for ObjectId, {"$date": "..."} for ISODate, and {"$regex": "...", "$options": "..."} for regular expressions. Example: [{"$match": {"status": "active"}}, {"$group": {"_id": "$category", "total": {"$sum": 1}}}]',
+                'Aggregation pipeline as JSON array string. Supports MongoDB extended JSON: use {"$oid": "..."} for ObjectId, {"$date": "..."} for ISODate, and {"$regex": "...", "$options": "ims"} for regular expressions. Example: [{"$match": {"status": "active"}}, {"$group": {"_id": "$category", "total": {"$sum": 1}}}]',
             },
             limit: {
               type: 'number',
@@ -251,9 +294,22 @@ function resolveDb(args) {
 }
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
+  const { name, arguments: rawArgs } = request.params;
 
   try {
+    const args = rawArgs && typeof rawArgs === 'object' ? rawArgs : {};
+    // Bound every string argument before it is parsed or sent to MongoDB.
+    for (const key of [
+      'database',
+      'collection',
+      'field',
+      'query',
+      'sort',
+      'pipeline',
+    ]) {
+      assertBoundedString(key, args[key], MAX_INPUT_LENGTH);
+    }
+
     await connectMongoDB();
 
     switch (name) {
@@ -279,7 +335,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
         try {
           const adminDb = client.db('admin').admin();
-          const result = await adminDb.listDatabases();
+          const result = await withTimeout(
+            adminDb.listDatabases(),
+            MAX_TIME_MS,
+            'listDatabases'
+          );
           return {
             content: [
               {
@@ -288,7 +348,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               },
             ],
           };
-        } catch {
+        } catch (error) {
+          // Only an authorization failure justifies the scoped fallback;
+          // network/timeout errors must surface as errors to the client.
+          if (!isAuthorizationError(error)) throw error;
           return {
             content: [
               {
@@ -311,7 +374,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'list_collections': {
         const targetDb = resolveDb(args);
-        const collections = await targetDb.listCollections().toArray();
+        const collections = await targetDb
+          .listCollections({}, { maxTimeMS: MAX_TIME_MS })
+          .toArray();
         return {
           content: [
             {
@@ -327,7 +392,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const collection = targetDb.collection(args.collection);
         const query = parseQuery(args.query);
         const limit = parseLimit(args.limit, 10, MAX_LIMIT);
-        const skip = parseSkip(args.skip);
+        const skip = parseSkip(args.skip, MAX_SKIP);
         const sort = args.sort ? parseQuery(args.sort) : undefined;
 
         let results;
@@ -372,14 +437,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const targetDb = resolveDb(args);
         const collection = targetDb.collection(args.collection);
         const query = parseQuery(args.query);
-        const values = await collection.distinct(args.field, query, {
+        const all = await collection.distinct(args.field, query, {
           maxTimeMS: MAX_TIME_MS,
         });
+        const { values, note } = capValues(all, MAX_DISTINCT);
+        const text = note
+          ? `${JSON.stringify(values, null, 2)}\n\nNote: ${note}`
+          : JSON.stringify(values, null, 2);
         return {
           content: [
             {
               type: 'text',
-              text: JSON.stringify(values, null, 2),
+              text,
             },
           ],
         };

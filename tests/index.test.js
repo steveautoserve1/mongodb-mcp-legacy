@@ -1,6 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import pkg from 'mongodb';
 import {
+  assertBoundedString,
+  capValues,
+  isAuthorizationError,
   parseDatabaseName,
   parseLimit,
   parseQuery,
@@ -440,5 +443,191 @@ describe('transformQuery prototype safety', () => {
       true
     );
     expect(result.constructor).toBe('x');
+  });
+});
+
+describe('parseDatabaseName (percent-encoding)', () => {
+  it('percent-decodes the database segment like the driver does', () => {
+    expect(parseDatabaseName('mongodb://host/db%2Ftest')).toBe('db/test');
+  });
+
+  it('falls back to the raw segment on a malformed percent-escape', () => {
+    expect(parseDatabaseName('mongodb://host/db%ZZ')).toBe('db%ZZ');
+  });
+});
+
+describe('validatePipeline (extended)', () => {
+  it('rejects $accumulator (MongoDB 4.2+ server-side JS)', () => {
+    expect(() =>
+      validatePipeline([
+        {
+          $project: {
+            x: {
+              $accumulator: {
+                init: '()=>1',
+                accumulate: '(s,v)=>s',
+                result: 's',
+                lang: 'js',
+              },
+            },
+          },
+        },
+      ])
+    ).toThrow('forbidden operator $accumulator');
+  });
+
+  it('rejects $where nested in a pipeline stage (defense in depth)', () => {
+    expect(() => validatePipeline([{ $match: { $where: 'true' } }])).toThrow(
+      '$where'
+    );
+  });
+
+  it('rejects pipelines over the stage limit', () => {
+    const pipeline = Array.from({ length: 101 }, () => ({ $match: {} }));
+    expect(() => validatePipeline(pipeline)).toThrow('maximum allowed is 100');
+  });
+
+  it('accepts a pipeline at the stage limit', () => {
+    const pipeline = Array.from({ length: 100 }, () => ({ $match: {} }));
+    expect(() => validatePipeline(pipeline)).not.toThrow();
+  });
+});
+
+describe('parseQuery (operator policy)', () => {
+  it('rejects $where in a query filter', () => {
+    expect(() => parseQuery('{"$where": "true"}')).toThrow(
+      'server-side JavaScript execution is disabled'
+    );
+  });
+
+  it('rejects $where nested in a query filter', () => {
+    expect(() =>
+      parseQuery('{"$and": [{"status": "active"}, {"$where": "this.x"}]}')
+    ).toThrow('$where');
+  });
+
+  it('rejects $where in a sort spec', () => {
+    expect(() => parseQuery('{"$where": 1}')).toThrow('$where');
+  });
+
+  it('rejects $where inside a pipeline string', () => {
+    expect(() => parseQuery('[{"$match": {"$where": "true"}}]')).toThrow(
+      '$where'
+    );
+  });
+
+  it('does not report transform failures as invalid JSON', () => {
+    expect(() =>
+      parseQuery('{"_id": {"$oid": "not-an-objectid"}}')
+    ).not.toThrow('Invalid JSON query');
+  });
+
+  it('rejects unsupported $options with a specific error', () => {
+    expect(() => parseQuery('{"a": {"$regex": "b", "$options": "x"}}')).toThrow(
+      'Unsupported $options'
+    );
+  });
+
+  it('rejects non-string $options with a specific error', () => {
+    expect(() => parseQuery('{"a": {"$regex": "b", "$options": 1}}')).toThrow(
+      'Unsupported $options'
+    );
+  });
+
+  it('accepts the supported $options flags', () => {
+    const r = parseQuery('{"a": {"$regex": "b", "$options": "ims"}}');
+    expect(r.a).toBeInstanceOf(RegExp);
+    expect(r.a.flags).toBe('ims');
+  });
+});
+
+describe('parseSkip (cap)', () => {
+  it('throws when skip exceeds the cap', () => {
+    expect(() => parseSkip(2000000, 1000000)).toThrow('maximum of 1000000');
+  });
+
+  it('accepts skip at the cap', () => {
+    expect(parseSkip(1000000, 1000000)).toBe(1000000);
+  });
+
+  it('imposes no cap when maxSkip is omitted', () => {
+    expect(parseSkip(5)).toBe(5);
+  });
+});
+
+describe('assertBoundedString', () => {
+  it('passes short strings and non-strings', () => {
+    expect(() => assertBoundedString('query', 'short', 10)).not.toThrow();
+    expect(() => assertBoundedString('query', 42, 10)).not.toThrow();
+    expect(() => assertBoundedString('query', undefined, 10)).not.toThrow();
+  });
+
+  it('throws for strings over the limit', () => {
+    expect(() => assertBoundedString('query', 'x'.repeat(11), 10)).toThrow(
+      'maximum allowed is 10'
+    );
+  });
+});
+
+describe('capValues', () => {
+  it('returns values unchanged under the cap', () => {
+    const { values, note } = capValues([1, 2, 3], 10);
+    expect(values).toEqual([1, 2, 3]);
+    expect(note).toBeNull();
+  });
+
+  it('truncates over the cap and reports the hidden count', () => {
+    const { values, note } = capValues([1, 2, 3, 4, 5], 3);
+    expect(values).toEqual([1, 2, 3]);
+    expect(note).toContain('5');
+  });
+});
+
+describe('isAuthorizationError', () => {
+  it('detects code 13', () => {
+    expect(isAuthorizationError({ code: 13, message: 'boom' })).toBe(true);
+  });
+
+  it('detects authorization messages', () => {
+    expect(
+      isAuthorizationError({
+        message: 'not authorized on test to execute command',
+      })
+    ).toBe(true);
+    expect(
+      isAuthorizationError({
+        message: 'command "listDatabases" requires authentication',
+      })
+    ).toBe(true);
+  });
+
+  it('rejects network errors and non-objects', () => {
+    expect(
+      isAuthorizationError({
+        name: 'MongoNetworkError',
+        message: 'connect ECONNREFUSED',
+      })
+    ).toBe(false);
+    expect(isAuthorizationError(null)).toBe(false);
+  });
+});
+
+describe('sanitizeError (extended)', () => {
+  it('redacts credentials when the password contains a slash', () => {
+    expect(
+      sanitizeError('failed to connect to mongodb://admin:pa/ss@host:27017/db')
+    ).toBe('failed to connect to mongodb://***:***@host:27017/db');
+  });
+
+  it('redacts bare user:***@host credentials without a scheme', () => {
+    expect(sanitizeError('auth failed for bob:***@mongo.internal')).toBe(
+      'auth failed for ***:***@mongo.internal'
+    );
+  });
+
+  it('scrubs IPv4 addresses', () => {
+    expect(sanitizeError('connect ECONNREFUSED 10.0.0.5:27017')).toBe(
+      'connect ECONNREFUSED x.x.x.x:27017'
+    );
   });
 });

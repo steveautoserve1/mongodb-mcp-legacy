@@ -57,6 +57,9 @@ The server reads the `MONGODB_URI` environment variable to connect. If not set, 
 | `MONGODB_URI`                     | `mongodb://localhost:27017` | Connection string. **Must include a database name** (e.g. `mongodb://host:27017/mydb`).                                                                   |
 | `MONGODB_MCP_ALLOW_ALL_DATABASES` | _(unset)_                   | Set to `true` to let tools address databases other than the `MONGODB_URI` database and to enumerate all databases. Default: strict single-database scope. |
 | `MONGODB_MCP_MAX_LIMIT`           | `1000`                      | Hard cap on documents a single `execute_query`/`aggregate` call may return.                                                                               |
+| `MONGODB_MCP_MAX_SKIP`            | `1000000`                   | Hard cap on `skip` (documents scanned past) for a single `execute_query` call.                                                                            |
+| `MONGODB_MCP_MAX_INPUT_LENGTH`    | `65536`                     | Hard cap on the length (characters) of any single string argument (query, sort, pipeline, ...).                                                          |
+| `MONGODB_MCP_MAX_DISTINCT`        | `1000`                      | Hard cap on distinct values a single `distinct_values` call may return; extras are truncated with a note.                                                |
 | `MONGODB_MCP_MAX_TIME_MS`         | `10000`                     | Server-side timeout (ms) applied to every operation.                                                                                                      |
 
 ### Claude Code
@@ -151,11 +154,12 @@ count_documents({ collection: "orders", query: '{"total": {"$gt": 100}}' })
 
 ## Security
 
-- **Enforced read-only** -- the `aggregate` tool rejects pipelines containing `$out`, `$merge`, or `$function`, so no tool in this server can write data or execute server-side JavaScript.
+- **Enforced read-only** -- the `aggregate` tool rejects pipelines containing `$out`, `$merge`, `$function`, `$accumulator`, or `$where` (and is limited to 100 stages), and `$where` is rejected in every query filter, sort spec, and pipeline stage, so no tool in this server can write data or execute server-side JavaScript.
 - **Single-database scope by default** -- tools only address the database named in `MONGODB_URI` (and `list_databases` only reports it) unless you explicitly set `MONGODB_MCP_ALLOW_ALL_DATABASES=true`. For defense in depth, still use a least-privilege MongoDB user.
-- **Bounded reads** -- every operation runs with a server-side `maxTimeMS` timeout (default 10 s) and result sets are capped (default 1000 documents per call).
-- **Credential redaction** -- error messages are scrubbed of `user:***@` URI credentials before they reach the MCP client.
+- **Bounded reads** -- every operation runs with a server-side `maxTimeMS` timeout (default 10 s); result sets are capped (default 1000 documents per call), `skip` is capped (default 1,000,000), `distinct_values` output is capped (default 1000 values, truncated with a note), and every string argument is length-capped (default 65,536 characters).
+- **Credential redaction** -- error messages are scrubbed of `user:***@` credentials (scheme-prefixed or bare, including passwords with special characters) and IPv4 addresses before they reach the MCP client.
 - **No telemetry** -- the server makes no network calls other than the MongoDB connection in `MONGODB_URI`. Production dependencies are the official `mongodb` driver and the official MCP SDK.
+- **Accepted risk: EOL driver line** -- the `mongodb` 3.7.4 driver (the last 3.x release) is pinned intentionally: it targets legacy MongoDB 3.2+ servers that newer drivers have dropped. The 3.x line is end-of-life and will not receive security updates; this is a consciously accepted trade-off for legacy compatibility.
 
 ## Development
 

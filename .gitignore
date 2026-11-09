@@ -12,3 +12,7 @@ dist/
 *.swp
 *.swo
 *~
+
+# Single package manager: pnpm (keep exactly one lockfile)
+package-lock.json
+npm-shrinkwrap.json
